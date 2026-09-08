@@ -43,12 +43,20 @@ struct Incident {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // ------------------------------------------------------------
+    // DATABASE
+    // ------------------------------------------------------------
+
     let url = env::var("DATABASE_URL")?;
 
     let pool = PgPoolOptions::new()
         .max_connections(10)
         .connect(&url)
         .await?;
+
+    // ------------------------------------------------------------
+    // REAL-TIME UPDATE CHANNEL
+    // ------------------------------------------------------------
 
     let (updates, _) = broadcast::channel::<String>(200);
 
@@ -57,7 +65,10 @@ async fn main() -> Result<()> {
         updates: updates.clone(),
     };
 
-    // Listen for PostgreSQL NOTIFY events and forward them to browsers.
+    // ------------------------------------------------------------
+    // POSTGRES NOTIFY -> SSE
+    // ------------------------------------------------------------
+
     let listener_pool = pool.clone();
     let listener_updates = updates.clone();
 
@@ -105,6 +116,10 @@ async fn main() -> Result<()> {
         }
     });
 
+    // ------------------------------------------------------------
+    // ROUTES
+    // ------------------------------------------------------------
+
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/incidents", get(incidents))
@@ -114,22 +129,39 @@ async fn main() -> Result<()> {
         .with_state(state)
         .layer(CorsLayer::permissive());
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+    // ------------------------------------------------------------
+    // CLOUD/LOCAL PORT
+    // ------------------------------------------------------------
 
-    println!("PULSE API listening on :8080");
+    // Render provides PORT.
+    // Locally, default to 8080.
+    let port = env::var("PORT").unwrap_or_else(|_| "8080".to_string());
 
+    let addr = format!("0.0.0.0:{port}");
+
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+
+    println!("PULSE API listening on {addr}");
+
+    // IMPORTANT: only ONE axum::serve call.
     axum::serve(listener, app).await?;
 
     Ok(())
 }
 
+// ------------------------------------------------------------
+// HEALTH
+// ------------------------------------------------------------
+
 async fn health() -> &'static str {
     "ok"
 }
 
-async fn incidents(
-    State(state): State<AppState>,
-) -> Result<Json<Vec<Incident>>, StatusCode> {
+// ------------------------------------------------------------
+// INCIDENTS
+// ------------------------------------------------------------
+
+async fn incidents(State(state): State<AppState>) -> Result<Json<Vec<Incident>>, StatusCode> {
     sqlx::query_as::<_, Incident>(
         r#"
         SELECT
@@ -161,6 +193,10 @@ async fn incidents(
     })
 }
 
+// ------------------------------------------------------------
+// TOPOLOGY
+// ------------------------------------------------------------
+
 async fn topology() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "nodes": [
@@ -179,19 +215,14 @@ async fn topology() -> Json<serde_json::Value> {
     }))
 }
 
+// ------------------------------------------------------------
+// RECENT EVENTS
+// ------------------------------------------------------------
+
 async fn recent_events(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    let rows = sqlx::query_as::<
-        _,
-        (
-            String,
-            DateTime<Utc>,
-            String,
-            Option<f64>,
-            Option<i32>,
-        ),
-    >(
+    let rows = sqlx::query_as::<_, (String, DateTime<Utc>, String, Option<f64>, Option<i32>)>(
         r#"
         SELECT
             event_id,
@@ -227,21 +258,18 @@ async fn recent_events(
     Ok(Json(events))
 }
 
-// REAL-TIME SERVER-SENT EVENTS ENDPOINT
-async fn stream(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+// ------------------------------------------------------------
+// REAL-TIME SERVER-SENT EVENTS
+// ------------------------------------------------------------
+
+async fn stream(State(state): State<AppState>) -> impl IntoResponse {
     let receiver = state.updates.subscribe();
 
-    let stream = BroadcastStream::new(receiver).filter_map(|result| {
-        match result {
-            Ok(payload) => Some(Ok::<Event, Infallible>(
-                Event::default()
-                    .event("incident_changed")
-                    .data(payload),
-            )),
-            Err(_) => None,
-        }
+    let stream = BroadcastStream::new(receiver).filter_map(|result| match result {
+        Ok(payload) => Some(Ok::<Event, Infallible>(
+            Event::default().event("incident_changed").data(payload),
+        )),
+        Err(_) => None,
     });
 
     Sse::new(stream).keep_alive(
