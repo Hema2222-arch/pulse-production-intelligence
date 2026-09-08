@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>PULSE Demo Simulator</title>
+<style>
+body{margin:0;background:#050b19;color:#edf5ff;font-family:Inter,system-ui,sans-serif}.wrap{max-width:980px;margin:auto;padding:38px 22px}.top{display:flex;justify-content:space-between;align-items:center}.logo{font-weight:900;letter-spacing:4px;font-size:24px}.btn{border:1px solid #234c7e;background:#0a1c39;border-radius:10px;padding:13px 16px;color:#e7f2ff;font-weight:800;cursor:pointer}.danger{border-color:#8c2944;background:#3b1724}.success{border-color:#237654;background:#0b2b21}.hero{margin:70px 0 26px}.hero h1{font-size:56px;line-height:1;margin:0 0 18px}.hero p{color:#91a9cb;max-width:650px;line-height:1.7}.panel{border:1px solid #173a68;background:#091831;border-radius:16px;padding:24px}.controls{display:flex;gap:12px;flex-wrap:wrap}.status{margin-top:18px;padding:14px;border-radius:10px;background:#07182e;color:#a8c0df}.steps{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:22px}.step{border:1px solid #193f6e;border-radius:10px;padding:15px;background:#0b2040}.step small{display:block;color:#7895bc;margin-top:5px}.log{margin-top:18px;min-height:160px;background:#040b18;border:1px solid #132f54;border-radius:10px;padding:14px;font-family:ui-monospace,Consolas,monospace;color:#a7c7eb;white-space:pre-wrap}@media(max-width:760px){.hero h1{font-size:42px}.steps{grid-template-columns:1fr 1fr}}
+</style></head>
+<body><main class="wrap"><div class="top"><a class="logo" href="/">PULSE</a><div><a href="/dashboard.html" class="btn">Dashboard</a></div></div>
+<div class="hero"><h1>Incident Simulator</h1><p>Use the real Payment service controls to demonstrate a production-style failure: database degradation → payment latency → anomaly correlation → root-cause ranking → recovery.</p></div>
+<section class="panel"><div class="controls"><button id="start" class="btn danger">Start Database Incident</button><button id="stop" class="btn success">Recover System</button><button id="traffic" class="btn">Generate 30s Traffic</button></div>
+<div id="status" class="status">Ready. Start an incident to begin the demo.</div>
+<div class="steps"><div class="step">1. Degrade DB<small>~750ms / 500</small></div><div class="step">2. Payment impact<small>~900ms / 500</small></div><div class="step">3. Correlate<small>Dependency evidence</small></div><div class="step">4. Recover<small>Healthy 200s</small></div></div>
+<div id="log" class="log">PULSE demo ready.</div></section></main>
+<script>
+const $=id=>document.getElementById(id), log=msg=>{$('log').textContent=new Date().toLocaleTimeString()+'  '+msg+'\n'+$('log').textContent};
+$('start').onclick=async()=>{try{const r=await fetch('http://localhost:7001/incident/start',{method:'POST'});const t=await r.text();$('status').textContent='Incident started. Generate traffic and watch the dashboard/processor logs.';log('START → '+t)}catch(e){log('START ERROR → '+e.message)}};
+$('stop').onclick=async()=>{try{const r=await fetch('http://localhost:7001/incident/stop',{method:'POST'});const t=await r.text();$('status').textContent='Recovery requested. Generate healthy traffic to confirm resolution.';log('STOP → '+t)}catch(e){log('STOP ERROR → '+e.message)}};
+$('traffic').onclick=()=>{log('Run this in PowerShell: python D:\\pulse-project\\scripts\\generate_traffic.py --seconds 30');$('status').textContent='Traffic command copied to the log. Run it in your project terminal.'};
+</script></body></html>
