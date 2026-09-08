@@ -54,7 +54,13 @@ impl Window {
 
         let mean = self.mean();
 
-        (self.values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / self.values.len() as f64)
+        (
+            self.values
+                .iter()
+                .map(|x| (x - mean).powi(2))
+                .sum::<f64>()
+                / self.values.len() as f64
+        )
             .sqrt()
     }
 }
@@ -68,29 +74,78 @@ struct CorrelationState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let brokers = env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".into());
+    // ------------------------------------------------------------
+    // Kafka / Redpanda
+    // ------------------------------------------------------------
 
-    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL required");
+    let brokers =
+        env::var("KAFKA_BROKERS")
+            .unwrap_or_else(|_| "localhost:9092".into());
+
+    // ------------------------------------------------------------
+    // PostgreSQL
+    // ------------------------------------------------------------
+
+    let database_url =
+        env::var("DATABASE_URL")
+            .expect("DATABASE_URL required");
 
     let pool = PgPoolOptions::new()
         .max_connections(10)
         .connect(&database_url)
         .await?;
 
-    let consumer: StreamConsumer = ClientConfig::new()
+    // ------------------------------------------------------------
+    // Kafka consumer configuration
+    // ------------------------------------------------------------
+
+    let mut client_config = ClientConfig::new();
+
+    client_config
         .set("group.id", "pulse-processor")
         .set("bootstrap.servers", &brokers)
-        .set("enable.auto.commit", "true")
-        .create()?;
+        .set("enable.auto.commit", "true");
 
-    consumer.subscribe(&["telemetry", "deployments"])?;
+    // Redpanda Cloud authentication.
+    // These variables are only required in the cloud.
+    if let (Ok(username), Ok(password)) = (
+        env::var("KAFKA_USERNAME"),
+        env::var("KAFKA_PASSWORD"),
+    ) {
+        client_config
+            .set("security.protocol", "SASL_SSL")
+            .set("sasl.mechanisms", "SCRAM-SHA-256")
+            .set("sasl.username", &username)
+            .set("sasl.password", &password);
+    }
 
-    let windows: Arc<RwLock<HashMap<String, Window>>> = Arc::new(RwLock::new(HashMap::new()));
+    let consumer: StreamConsumer =
+        client_config.create()?;
+
+    consumer.subscribe(&[
+        "telemetry",
+        "deployments",
+    ])?;
+
+    // ------------------------------------------------------------
+    // Detection state
+    // ------------------------------------------------------------
+
+    let windows: Arc<RwLock<HashMap<String, Window>>> =
+        Arc::new(RwLock::new(HashMap::new()));
 
     let correlation: Arc<RwLock<CorrelationState>> =
-        Arc::new(RwLock::new(CorrelationState::default()));
+        Arc::new(RwLock::new(
+            CorrelationState::default()
+        ));
 
-    println!("PULSE stream processor listening on {brokers}");
+    println!(
+        "PULSE stream processor listening on {brokers}"
+    );
+
+    // ------------------------------------------------------------
+    // Kafka event loop
+    // ------------------------------------------------------------
 
     loop {
         match consumer.recv().await {
@@ -103,21 +158,39 @@ async fn main() -> Result<()> {
                     continue;
                 };
 
-                let event = match serde_json::from_slice::<Event>(payload) {
-                    Ok(event) => event,
-                    Err(error) => {
-                        eprintln!("Invalid telemetry JSON: {error}");
-                        continue;
-                    }
-                };
+                let event =
+                    match serde_json::from_slice::<Event>(payload) {
+                        Ok(event) => event,
 
-                if let Err(error) = process_event(&pool, &windows, &correlation, &event).await {
-                    eprintln!("PULSE event processing error: {error}");
+                        Err(error) => {
+                            eprintln!(
+                                "Invalid telemetry JSON: {error}"
+                            );
+                            continue;
+                        }
+                    };
+
+                if let Err(error) =
+                    process_event(
+                        &pool,
+                        &windows,
+                        &correlation,
+                        &event,
+                    )
+                    .await
+                {
+                    eprintln!(
+                        "PULSE event processing error: {error}"
+                    );
                 }
             }
         }
     }
 }
+
+// ============================================================================
+// EVENT PROCESSING
+// ============================================================================
 
 async fn process_event(
     pool: &PgPool,
@@ -148,9 +221,21 @@ async fn process_event(
         )
         VALUES
         (
-            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12
+            $1,
+            $2,
+            $3,
+            $4,
+            $5,
+            $6,
+            $7,
+            $8,
+            $9,
+            $10,
+            $11,
+            $12
         )
-        ON CONFLICT (event_id) DO NOTHING
+        ON CONFLICT (event_id)
+        DO NOTHING
         "#,
     )
     .bind(&event.event_id)
@@ -179,10 +264,17 @@ async fn process_event(
     let key = format!(
         "{}:{}",
         event.service,
-        event.endpoint.clone().unwrap_or_default()
+        event.endpoint
+            .clone()
+            .unwrap_or_default()
     );
 
-    let (baseline, sigma, anomaly, normal) = {
+    let (
+        baseline,
+        sigma,
+        anomaly,
+        normal,
+    ) = {
         let mut map = windows.write().await;
 
         let window = map.entry(key).or_default();
@@ -191,110 +283,176 @@ async fn process_event(
         let sigma = window.stddev();
         let sample_count = window.values.len();
 
-        // Statistical anomaly.
+        // Statistical anomaly
         let statistical_anomaly =
-            sample_count >= 20 && sigma > 0.0 && latency > baseline + (3.0 * sigma);
+            sample_count >= 20
+                && sigma > 0.0
+                && latency > baseline + (3.0 * sigma);
 
-        // Hard safety threshold for clearly pathological latency.
-        let threshold_anomaly = (event.service == "postgres" && latency >= 500.0)
-            || (event.service == "payment" && latency >= 500.0);
+        // Hard latency threshold for known pathological states
+        let threshold_anomaly =
+            (event.service == "postgres"
+                && latency >= 500.0)
+                ||
+            (event.service == "payment"
+                && latency >= 500.0);
 
-        let anomaly = threshold_anomaly || statistical_anomaly;
+        let anomaly =
+            threshold_anomaly
+                || statistical_anomaly;
 
-        // Recovery requires a genuinely healthy signal.
-        let normal = sample_count >= 20 && latency < 200.0 && event.status == Some(200);
+        // Recovery requires a genuinely healthy event.
+        let normal =
+            sample_count >= 20
+                && latency < 200.0
+                && event.status == Some(200);
 
         window.push(latency);
 
-        (baseline, sigma, anomaly, normal)
+        (
+            baseline,
+            sigma,
+            anomaly,
+            normal,
+        )
     };
 
     println!(
         "Telemetry: service={} latency={}ms anomaly={}",
-        event.service, latency, anomaly
+        event.service,
+        latency,
+        anomaly
     );
 
     // ------------------------------------------------------------
-    // 3. Capture database anomaly
+    // 3. Database anomaly
     // ------------------------------------------------------------
 
-    if event.service == "postgres" && anomaly {
-        let mut state = correlation.write().await;
+    if event.service == "postgres"
+        && anomaly
+    {
+        let mut state =
+            correlation.write().await;
 
-        state.database_anomaly = Some((event.timestamp, latency));
+        state.database_anomaly =
+            Some((event.timestamp, latency));
 
-        println!("DATABASE ANOMALY detected: {} ms", latency);
+        println!(
+            "DATABASE ANOMALY detected: {} ms",
+            latency
+        );
     }
 
     // ------------------------------------------------------------
-    // 4. Capture payment anomaly
+    // 4. Payment anomaly
     // ------------------------------------------------------------
 
-    if event.service == "payment" && anomaly {
-        let mut state = correlation.write().await;
+    if event.service == "payment"
+        && anomaly
+    {
+        let mut state =
+            correlation.write().await;
 
-        state.payment_anomaly = Some((event.timestamp, latency));
+        state.payment_anomaly =
+            Some((event.timestamp, latency));
 
-        println!("PAYMENT ANOMALY detected: {} ms", latency);
+        println!(
+            "PAYMENT ANOMALY detected: {} ms",
+            latency
+        );
     }
 
     // ------------------------------------------------------------
-    // 5. Correlate database -> payment
+    // 5. Database -> Payment correlation
     // ------------------------------------------------------------
 
-    if event.service == "payment" && anomaly {
-        let mut state = correlation.write().await;
+    if event.service == "payment"
+        && anomaly
+    {
+        let mut state =
+            correlation.write().await;
 
         let root_cause_is_database =
-            if let Some((database_time, database_latency)) = state.database_anomaly {
-                let gap_seconds = event
-                    .timestamp
-                    .signed_duration_since(database_time)
-                    .num_seconds()
-                    .abs();
+            if let Some((
+                database_time,
+                database_latency,
+            )) = state.database_anomaly
+            {
+                let gap_seconds =
+                    event
+                        .timestamp
+                        .signed_duration_since(
+                            database_time,
+                        )
+                        .num_seconds()
+                        .abs();
 
-                gap_seconds <= 30 && database_latency >= 500.0
+                gap_seconds <= 30
+                    && database_latency >= 500.0
             } else {
                 false
             };
 
-        let (confidence, root_cause, root_cause_service) = if root_cause_is_database {
-            (
-                0.88,
-                "Database degradation is the most likely root cause",
-                "postgres",
-            )
-        } else {
-            (0.55, "Investigate latency anomaly", "payment")
-        };
+        let (
+            confidence,
+            root_cause,
+            root_cause_service,
+        ) =
+            if root_cause_is_database {
+                (
+                    0.88,
+                    "Database degradation is the most likely root cause",
+                    "postgres",
+                )
+            } else {
+                (
+                    0.55,
+                    "Investigate latency anomaly",
+                    "payment",
+                )
+            };
 
-        let severity = if latency >= baseline.max(1.0) * 10.0 {
-            "CRITICAL"
-        } else {
-            "HIGH"
-        };
+        let severity =
+            if latency >= baseline.max(1.0) * 10.0 {
+                "CRITICAL"
+            } else {
+                "HIGH"
+            };
 
-        let incident_key = "anomaly:payment:/charge";
+        let incident_key =
+            "anomaly:payment:/charge";
 
-        let evidence = serde_json::json!([
-            {
-                "kind": "latency_anomaly",
-                "service": "payment",
-                "endpoint": "/charge",
-                "baseline_ms": baseline,
-                "observed_ms": latency,
-                "sigma": sigma
-            },
-            {
-                "kind": "dependency_correlation",
-                "dependency": "database",
-                "database_anomaly": root_cause_is_database,
-                "root_cause_service": root_cause_service,
-                "confidence": confidence
-            }
-        ]);
+        let evidence =
+            serde_json::json!([
+                {
+                    "kind": "latency_anomaly",
+                    "service": "payment",
+                    "endpoint": "/charge",
+                    "baseline_ms": baseline,
+                    "observed_ms": latency,
+                    "sigma": sigma
+                },
+                {
+                    "kind": "dependency_correlation",
+                    "dependency": "database",
+                    "database_anomaly":
+                        root_cause_is_database,
+                    "root_cause_service":
+                        root_cause_service,
+                    "confidence":
+                        confidence
+                }
+            ]);
 
-        let affected_services = serde_json::json!(["payment", "order"]);
+        let affected_services =
+            serde_json::json!([
+                "payment",
+                "order"
+            ]);
+
+        // --------------------------------------------------------
+        // Create/update incident
+        // --------------------------------------------------------
 
         sqlx::query(
             r#"
@@ -326,13 +484,19 @@ async fn process_event(
             )
             ON CONFLICT (incident_key)
             DO UPDATE SET
-                severity = EXCLUDED.severity,
+                severity =
+                    EXCLUDED.severity,
                 status = 'OPEN',
-                confidence = EXCLUDED.confidence,
-                root_cause = EXCLUDED.root_cause,
-                root_cause_service = EXCLUDED.root_cause_service,
-                affected_services = EXCLUDED.affected_services,
-                evidence = EXCLUDED.evidence
+                confidence =
+                    EXCLUDED.confidence,
+                root_cause =
+                    EXCLUDED.root_cause,
+                root_cause_service =
+                    EXCLUDED.root_cause_service,
+                affected_services =
+                    EXCLUDED.affected_services,
+                evidence =
+                    EXCLUDED.evidence
             "#,
         )
         .bind(incident_key)
@@ -346,12 +510,19 @@ async fn process_event(
         .execute(pool)
         .await?;
 
-        state.active_payment_incident = Some(incident_key.to_string());
+        state.active_payment_incident =
+            Some(incident_key.to_string());
 
-        sqlx::query("SELECT pg_notify('pulse_incidents', $1)")
-            .bind(incident_key)
-            .execute(pool)
-            .await?;
+        // --------------------------------------------------------
+        // Notify API / dashboard
+        // --------------------------------------------------------
+
+        sqlx::query(
+            "SELECT pg_notify('pulse_incidents', $1)"
+        )
+        .bind(incident_key)
+        .execute(pool)
+        .await?;
 
         println!(
             "PULSE ROOT CAUSE: {} ({:.0}% confidence)",
@@ -364,10 +535,15 @@ async fn process_event(
     // 6. Automatic recovery
     // ------------------------------------------------------------
 
-    if event.service == "payment" && normal {
-        let mut state = correlation.write().await;
+    if event.service == "payment"
+        && normal
+    {
+        let mut state =
+            correlation.write().await;
 
-        if let Some(incident_key) = state.active_payment_incident.clone() {
+        if let Some(incident_key) =
+            state.active_payment_incident.clone()
+        {
             sqlx::query(
                 r#"
                 UPDATE incidents
@@ -383,16 +559,26 @@ async fn process_event(
             .execute(pool)
             .await?;
 
-            sqlx::query("SELECT pg_notify('pulse_incidents', $1)")
-                .bind(&incident_key)
-                .execute(pool)
-                .await?;
+            sqlx::query(
+                "SELECT pg_notify('pulse_incidents', $1)"
+            )
+            .bind(&incident_key)
+            .execute(pool)
+            .await?;
 
-            println!("PULSE INCIDENT RESOLVED: {}", incident_key);
+            println!(
+                "PULSE INCIDENT RESOLVED: {}",
+                incident_key
+            );
 
-            state.active_payment_incident = None;
-            state.payment_anomaly = None;
-            state.database_anomaly = None;
+            state.active_payment_incident =
+                None;
+
+            state.payment_anomaly =
+                None;
+
+            state.database_anomaly =
+                None;
         }
     }
 
