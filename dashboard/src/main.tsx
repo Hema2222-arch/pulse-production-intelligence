@@ -33,7 +33,7 @@ type Topology = { nodes: TopologyNode[]; edges: { source: string; target: string
 
 type FeedItem = { kind: string; at: string; title: string; detail: string; tone: string };
 
-const API = 'http://localhost:8080';
+const API = 'https://pulse-production-intelligence.onrender.com';
 const fmtTime = (ts: string) => new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 const fmtDateTime = (ts: string) => new Date(ts).toLocaleString([], { month: 'numeric', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit' });
 const pct = (v: number) => `${Math.round(v * 100)}%`;
